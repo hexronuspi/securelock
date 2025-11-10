@@ -1,0 +1,10 @@
+﻿{
+  "name": "com.exam.shield",
+  "path": "C:\\Users\\aruna\\Desktop\\iicpc\\securelock\\ExamShield.exe",
+  "description": "ExamShield bridge",
+  "allowed_origins": [
+    "chrome-extension://kakicebioibnnicdijmneakpoihelpgg/"
+  ],
+  "type": "stdio"
+}
+
