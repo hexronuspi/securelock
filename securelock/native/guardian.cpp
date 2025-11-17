@@ -1,6 +1,8 @@
 //cl /EHsc /std:c++17 /O2 /MT /W4 guardian.cpp user32.lib psapi.lib /Fe:ExamGuardian.exe
+#ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
+#endif
 
 #include <windows.h>
 #include <psapi.h>

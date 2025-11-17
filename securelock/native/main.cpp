@@ -1,4 +1,5 @@
 //cl /EHsc /std:c++17 /O2 /MT /W4 /I. main.cpp user32.lib crypt32.lib advapi32.lib wbemuuid.lib ole32.lib oleaut32.lib setupapi.lib psapi.lib ntdll.lib /Fe:ExamShield.exe
+#ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -8,9 +9,11 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
+#endif
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <wincrypt.h>
 #include <intrin.h>
 #include <io.h>
 #include <fcntl.h>
@@ -29,9 +32,48 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <winternl.h>
+#include <deque>
+#include <cmath>
 #include <json.hpp>
 
 using json = nlohmann::json;
+
+// Keystroke monitoring structures
+struct KeyEvent {
+    DWORD vkCode;
+    DWORD timestamp;
+    bool isKeyDown;
+    bool isInjected;
+};
+
+class KeystrokeMonitor {
+public:
+    std::deque<KeyEvent> keyEvents;
+    HHOOK keyboardHook;
+    int totalKeystrokes;
+    int injectedKeystrokes;
+    double avgInterval;
+    double typingVariance;
+    int rapidSequences;
+    
+    KeystrokeMonitor() : keyboardHook(nullptr), totalKeystrokes(0), 
+                        injectedKeystrokes(0), avgInterval(0), 
+                        typingVariance(0), rapidSequences(0) {}
+    
+    void startMonitoring();
+    void stopMonitoring();
+    void analyzeKeystrokes();
+    int calculateKeystrokeRisk();
+    json getKeystrokeData();
+    
+private:
+    static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+    void processKeyEvent(DWORD vkCode, bool isKeyDown, bool isInjected);
+    double calculateVariance(const std::vector<double>& intervals);
+    bool isMeaningfulKeystroke(DWORD vkCode);
+};
+
+static KeystrokeMonitor* g_keystrokeMonitor = nullptr;
 
 const char* PRIVATE_KEY = "d4f8b2c1e5a7f3b9c6d2e8f1a4b7c5e9f2a6b3c7d1e5f8a2b6c9d3e7f1a5b8c2e6";
 
@@ -76,9 +118,41 @@ bool isRdpSession() {
     return GetSystemMetrics(SM_REMOTESESSION) != 0;
 }
 
-bool checkSuspiciousProcesses() {
-    const char* suspiciousProcesses[] = {
+bool checkVMProcesses() {
+    // VM-specific processes only
+    const char* vmProcesses[] = {
         "vmtoolsd.exe", "VBoxTray.exe", "VBoxClient.exe", "VBoxService.exe",
+        "vmware.exe", "vmwareuser.exe", "vmwaretray.exe", "vmsrvc.exe",
+        "xenservice.exe"
+    };
+    
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    if (!Process32First(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        return false;
+    }
+    
+    do {
+        for (const char* vmProc : vmProcesses) {
+            if (_stricmp(pe32.szExeFile, vmProc) == 0) {
+                CloseHandle(hSnapshot);
+                return true;
+            }
+        }
+    } while (Process32Next(hSnapshot, &pe32));
+    
+    CloseHandle(hSnapshot);
+    return false;
+}
+
+bool checkSuspiciousProcesses() {
+    // Remote access processes only (not VM processes)
+    const char* suspiciousProcesses[] = {
         "tv_x64.exe", "TeamViewer_Service.exe", "TeamViewer.exe",
         "AnyDesk.exe", "anydesk.exe", "RemotePC.exe",
         "chrome_remote_desktop_host.exe", "rdpclip.exe",
@@ -149,6 +223,10 @@ bool checkVMWMI() {
     HRESULT hr;
     IWbemLocator* pLoc = NULL;
     IWbemServices* pSvc = NULL;
+    IEnumWbemClassObject* pEnumerator = NULL;
+    BSTR strNetworkResource = NULL;
+    BSTR strQueryLanguage = NULL;
+    BSTR strQuery = NULL;
     bool isVM = false;
     
     // Initialize COM
@@ -165,7 +243,8 @@ bool checkVMWMI() {
     if (FAILED(hr)) goto cleanup;
     
     // Connect to WMI
-    hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
+    strNetworkResource = SysAllocString(L"ROOT\\CIMV2");
+    hr = pLoc->ConnectServer(strNetworkResource, NULL, NULL, 0, 0L, 0, 0, &pSvc);
     if (FAILED(hr)) goto cleanup;
     
     // Set security levels
@@ -174,9 +253,9 @@ bool checkVMWMI() {
     if (FAILED(hr)) goto cleanup;
     
     // Query Win32_ComputerSystem
-    IEnumWbemClassObject* pEnumerator = NULL;
-    hr = pSvc->ExecQuery(bstr_t("WQL"), 
-                        bstr_t("SELECT * FROM Win32_ComputerSystem"),
+    strQueryLanguage = SysAllocString(L"WQL");
+    strQuery = SysAllocString(L"SELECT * FROM Win32_ComputerSystem");
+    hr = pSvc->ExecQuery(strQueryLanguage, strQuery,
                         WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, 
                         NULL, &pEnumerator);
     
@@ -227,6 +306,10 @@ bool checkVMWMI() {
     }
     
 cleanup:
+    if (strNetworkResource) SysFreeString(strNetworkResource);
+    if (strQueryLanguage) SysFreeString(strQueryLanguage);
+    if (strQuery) SysFreeString(strQuery);
+    if (pEnumerator) pEnumerator->Release();
     if (pSvc) pSvc->Release();
     if (pLoc) pLoc->Release();
     CoUninitialize();
@@ -234,51 +317,246 @@ cleanup:
     return isVM;
 }
 
+// Monitor enumeration callback
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData) {
+    int* count = (int*)dwData;
+    (*count)++;
+    return TRUE;
+}
+
 int countMonitors() {
     int count = 0;
     
-    // Use SetupAPI to enumerate monitors
-    HDEVINFO hDevInfo = SetupDiGetClassDevs(&GUID_DEVINTERFACE_MONITOR, NULL, NULL, 
-                                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (hDevInfo == INVALID_HANDLE_VALUE) return 1;
-    
-    SP_DEVICE_INTERFACE_DATA deviceInterfaceData;
-    deviceInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
-    
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &GUID_DEVINTERFACE_MONITOR, 
-                                                  i, &deviceInterfaceData); i++) {
-        count++;
+    // Use EnumDisplayMonitors - more reliable method
+    if (EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)&count)) {
+        return count > 0 ? count : 1; // Default to 1 if no monitors found
     }
     
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-    return count > 0 ? count : 1; // Default to 1 if enumeration fails
+    // Fallback: Use GetSystemMetrics
+    int cxVirtualScreen = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int cyVirtualScreen = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    
+    // If virtual screen is larger than primary, likely multiple monitors
+    if (cxVirtualScreen > GetSystemMetrics(SM_CXSCREEN) || 
+        cyVirtualScreen > GetSystemMetrics(SM_CYSCREEN)) {
+        return 2; // Assume 2 monitors if virtual screen is larger
+    }
+    
+    return 1; // Default to 1 monitor
+}
+
+// Keystroke monitoring implementation
+void KeystrokeMonitor::startMonitoring() {
+    g_keystrokeMonitor = this;
+    keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
+    if (keyboardHook == nullptr) {
+        std::cerr << "Failed to install keyboard hook: " << GetLastError() << std::endl;
+    }
+}
+
+void KeystrokeMonitor::stopMonitoring() {
+    if (keyboardHook) {
+        UnhookWindowsHookEx(keyboardHook);
+        keyboardHook = nullptr;
+    }
+    g_keystrokeMonitor = nullptr;
+}
+
+LRESULT CALLBACK KeystrokeMonitor::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && g_keystrokeMonitor) {
+        KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
+        bool isKeyDown = (wParam == WM_KEYDOWN) || (wParam == WM_SYSKEYDOWN);
+        bool isInjected = (pKeyboard->flags & LLKHF_INJECTED) != 0;
+        
+        g_keystrokeMonitor->processKeyEvent(pKeyboard->vkCode, isKeyDown, isInjected);
+    }
+    
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+void KeystrokeMonitor::processKeyEvent(DWORD vkCode, bool isKeyDown, bool isInjected) {
+    if (!isKeyDown) return; // Only process key down events
+    
+    KeyEvent event;
+    event.vkCode = vkCode;
+    event.timestamp = GetTickCount();
+    event.isKeyDown = isKeyDown;
+    event.isInjected = isInjected;
+    
+    keyEvents.push_back(event);
+    
+    // Keep only last 2000 events (increased for better analysis)
+    if (keyEvents.size() > 2000) {
+        keyEvents.pop_front();
+    }
+    
+    totalKeystrokes++;
+    if (isInjected) {
+        injectedKeystrokes++;
+    }
+    
+    // Analyze patterns every 100 keystrokes (less frequent)
+    if (totalKeystrokes % 100 == 0) {
+        analyzeKeystrokes();
+    }
+}
+
+bool KeystrokeMonitor::isMeaningfulKeystroke(DWORD vkCode) {
+    // Filter out navigation and modifier keys
+    if (vkCode >= VK_F1 && vkCode <= VK_F24) return false; // Function keys
+    if (vkCode == VK_SHIFT || vkCode == VK_CONTROL || vkCode == VK_MENU) return false; // Modifiers
+    if (vkCode == VK_CAPITAL || vkCode == VK_NUMLOCK || vkCode == VK_SCROLL) return false; // Lock keys
+    if (vkCode >= VK_PRIOR && vkCode <= VK_DELETE) return false; // Navigation keys
+    if (vkCode >= VK_LEFT && vkCode <= VK_DOWN) return false; // Arrow keys
+    if (vkCode == VK_RETURN || vkCode == VK_TAB || vkCode == VK_ESCAPE) return false; // Formatting
+    if (vkCode == VK_SPACE || vkCode == VK_BACK) return false; // Space and backspace
+    
+    // Include alphanumeric and symbol keys
+    return (vkCode >= 0x30 && vkCode <= 0x5A) || // 0-9, A-Z
+           (vkCode >= VK_OEM_1 && vkCode <= VK_OEM_3) || // ;,-./, `
+           (vkCode >= VK_OEM_4 && vkCode <= VK_OEM_8); // [\]', etc
+}
+
+void KeystrokeMonitor::analyzeKeystrokes() {
+    if (keyEvents.size() < 20) return;
+    
+    // Filter meaningful keystrokes only
+    std::vector<KeyEvent> meaningfulKeys;
+    for (const auto& event : keyEvents) {
+        if (isMeaningfulKeystroke(event.vkCode)) {
+            meaningfulKeys.push_back(event);
+        }
+    }
+    
+    if (meaningfulKeys.size() < 10) return;
+    
+    std::vector<double> intervals;
+    int sampleSize = (meaningfulKeys.size() < 100) ? (int)meaningfulKeys.size() : 100;
+    auto startIt = meaningfulKeys.end() - sampleSize;
+    
+    for (auto current = startIt + 1; current != meaningfulKeys.end(); ++current) {
+        auto previous = current - 1;
+        double interval = current->timestamp - previous->timestamp;
+        // Filter out long pauses (thinking time)
+        if (interval < 5000) { // Less than 5 seconds
+            intervals.push_back(interval);
+        }
+    }
+    
+    if (intervals.size() < 5) return;
+    
+    // Calculate average interval
+    double sum = 0;
+    for (double interval : intervals) {
+        sum += interval;
+    }
+    avgInterval = sum / intervals.size();
+    
+    // Calculate variance
+    typingVariance = calculateVariance(intervals);
+    
+    // Detect rapid sequences (very conservative for coding)
+    int rapidCount = 0;
+    for (double interval : intervals) {
+        if (interval < 10) { // Less than 10ms between meaningful keystrokes
+            rapidCount++;
+        }
+    }
+    
+    // Only flag if majority of intervals are extremely rapid AND we have substantial data
+    if (rapidCount > intervals.size() * 0.7 && intervals.size() > 50) {
+        rapidSequences++;
+    }
+}
+
+double KeystrokeMonitor::calculateVariance(const std::vector<double>& intervals) {
+    if (intervals.size() < 2) return 0;
+    
+    double mean = 0;
+    for (double interval : intervals) {
+        mean += interval;
+    }
+    mean /= intervals.size();
+    
+    double variance = 0;
+    for (double interval : intervals) {
+        variance += (interval - mean) * (interval - mean);
+    }
+    variance /= intervals.size();
+    
+    return variance;
+}
+
+int KeystrokeMonitor::calculateKeystrokeRisk() {
+    int risk = 0;
+    
+    // High injection rate (very lenient for coding)
+    if (totalKeystrokes > 200) { // Require substantial keystrokes before flagging
+        double injectionRate = (double)injectedKeystrokes / totalKeystrokes;
+        if (injectionRate > 0.3) risk += 3; // More than 30% injected
+        else if (injectionRate > 0.2) risk += 1; // More than 20% injected
+    }
+    
+    // Suspicious timing patterns (very strict)
+    if (typingVariance < 25 && avgInterval < 15 && totalKeystrokes > 500) {
+        risk += 2; // Only flag with massive data and extreme consistency
+    }
+    
+    // Too many rapid sequences (very lenient)
+    if (rapidSequences > 20) { // Much higher threshold
+        risk += 1; // Minimal penalty
+    }
+    
+    // Impossibly fast typing (extremely lenient)
+    if (avgInterval > 0 && avgInterval < 10 && totalKeystrokes > 200) {
+        risk += 2; // Only flag truly impossible speeds
+    }
+    
+    return (risk < 10) ? risk : 10; // Cap at 10
+}
+
+json KeystrokeMonitor::getKeystrokeData() {
+    json data;
+    data["totalKeystrokes"] = totalKeystrokes;
+    data["injectedKeystrokes"] = injectedKeystrokes;
+    data["injectionRate"] = totalKeystrokes > 0 ? (double)injectedKeystrokes / totalKeystrokes : 0;
+    data["avgInterval"] = avgInterval;
+    data["typingVariance"] = typingVariance;
+    data["rapidSequences"] = rapidSequences;
+    data["riskScore"] = calculateKeystrokeRisk();
+    data["wpm"] = avgInterval > 0 ? (60000.0 / avgInterval) / 4.0 : 0; // Assuming 4 chars per word for coding
+    
+    return data;
 }
 
 bool checkSuspiciousMonitors() {
-    // This would require WMI query for WmiMonitorID
-    // Simplified version - just check monitor count
-    return countMonitors() > 2; // More than 2 monitors suspicious
+    // Flag only if more than 1 monitor (multiple displays could enable cheating)
+    // Single monitor (1) = OK, Multiple monitors (2+) = Suspicious
+    int monitors = countMonitors();
+    return monitors != 1;
 }
 
 bool isVirtualMachine() {
-    // Multiple detection methods
+    // Multiple detection methods - require at least 2 indicators to reduce false positives
+    int vmIndicators = 0;
     bool vmDetected = false;
     
-    // 1. CPUID hypervisor bit
+    // 1. CPUID hypervisor bit (can be false positive on Windows 10+ with Hyper-V)
     int cpuInfo[4] = {};
     __cpuid(cpuInfo, 1);
     bool hypervisorBit = (cpuInfo[2] >> 31) & 1;
+    if (hypervisorBit) vmIndicators++;
     
-    // 2. Check WMI
-    if (checkVMWMI()) vmDetected = true;
+    // 2. Check WMI (strong indicator)
+    if (checkVMWMI()) vmIndicators += 2;
     
-    // 3. Check registry
-    if (checkVMRegistry()) vmDetected = true;
+    // 3. Check registry (strong indicator)
+    if (checkVMRegistry()) vmIndicators += 2;
     
-    // 4. Check processes
-    if (checkSuspiciousProcesses()) vmDetected = true;
+    // 4. Check VM-specific processes (strong indicator)
+    if (checkVMProcesses()) vmIndicators += 2;
     
-    // 5. If hypervisor bit is set but no other indicators, 
+    // Require at least 3 indicators to flag as VM (reduces false positives) 
     //    it's likely just Windows security features
     if (hypervisorBit && !vmDetected) {
         // Check for common VM hypervisor signatures
@@ -385,12 +663,25 @@ int main() {
             bool suspiciousMonitors = checkSuspiciousMonitors();
             int monitorCount = countMonitors();
             
-            // Calculate risk score
+            // Initialize keystroke monitoring
+            static KeystrokeMonitor keystrokeMonitor;
+            static bool keystrokeInitialized = false;
+            
+            if (!keystrokeInitialized) {
+                keystrokeMonitor.startMonitoring();
+                keystrokeInitialized = true;
+            }
+            
+            // Calculate risk score (adjusted to total 100)
             int riskScore = 0;
-            if (vm) riskScore += 70;
-            if (rdp) riskScore += 30;
-            if (suspiciousProcesses) riskScore += 40;
-            if (suspiciousMonitors) riskScore += 20;
+            if (vm) riskScore += 47;  // Reduced from 50
+            if (rdp) riskScore += 27;  // Reduced from 30
+            if (suspiciousProcesses) riskScore += 36;  // Reduced from 40
+            if (suspiciousMonitors) riskScore += 27;  // Reduced from 30
+            
+            // Add keystroke risk (up to 10 points)
+            int keystrokeRisk = keystrokeMonitor.calculateKeystrokeRisk();
+            riskScore += keystrokeRisk;
             
             // Cap at 100
             if (riskScore > 100) riskScore = 100;
@@ -403,6 +694,7 @@ int main() {
             rep["suspicious_processes"] = suspiciousProcesses;
             rep["monitor_count"] = monitorCount;
             rep["suspicious_monitors"] = suspiciousMonitors;
+            rep["keystroke_data"] = keystrokeMonitor.getKeystrokeData();
             
             // Create tamper-proof signature
             std::string dataToSign = rep.dump();
