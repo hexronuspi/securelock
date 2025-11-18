@@ -86,6 +86,8 @@ REM Cleanup existing processes
 echo Terminating existing browser sessions...
 taskkill /F /IM chrome.exe >nul 2>&1
 taskkill /F /IM msedge.exe >nul 2>&1
+REM Wait a moment for processes to fully terminate
+timeout /t 2 /nobreak >nul
 
 REM Check if webface server is already running
 echo Checking exam interface server...
@@ -179,27 +181,44 @@ set user_data_dir_flag=
 echo Launching secure browser session...
 echo.
 
+:restart_chrome
 REM Launch Chrome with appropriate flags
+REM Check if extension exists
+if not exist "%cd%\extension\manifest.json" (
+    echo WARNING: Extension not found at %cd%\extension
+    echo Chrome will launch without security extension
+    set EXTENSION_FLAG=
+) else (
+    echo Extension found, loading security extension
+    set EXTENSION_FLAG=--load-extension="%cd%\extension"
+)
+
 if "%KIOSK_MODE%"=="true" (
     echo Starting in secure kiosk mode...
-    %chrome_path% ^
-        --start-fullscreen ^
-        --disable-pinch ^
-        --disable-session-restore ^
+    echo Command: %chrome_path% --kiosk --no-first-run %EXTENSION_FLAG% "http://localhost:3000?token=!token!&mode=exam"
+    start /wait "ExamShield-Chrome" %chrome_path% ^
+        --kiosk ^
         --no-first-run ^
-        --disable-default-apps ^
-        --disable-features=TranslateUI ^
-        --load-extension="%cd%\extension" ^
-        %user_data_dir_flag% ^
+        --disable-infobars ^
+        --disable-session-crashed-bubble ^
+        --disable-restore-session-state ^
+        --disable-background-timer-throttling ^
+        --disable-renderer-backgrounding ^
+        --disable-backgrounding-occluded-windows ^
+        --disable-web-security ^
+        %EXTENSION_FLAG% ^
         "http://localhost:3000?token=!token!&mode=exam"
 ) else (
     echo Starting in windowed mode...
-    %chrome_path% ^
-        --disable-session-restore ^
+    echo Command: %chrome_path% --start-maximized --no-first-run %EXTENSION_FLAG% "http://localhost:3000?token=!token!&mode=exam"
+    start /wait "ExamShield-Chrome" %chrome_path% ^
+        --start-maximized ^
         --no-first-run ^
-        --disable-default-apps ^
-        --load-extension="%cd%\extension" ^
-        %user_data_dir_flag% ^
+        --disable-infobars ^
+        --disable-background-timer-throttling ^
+        --disable-renderer-backgrounding ^
+        --disable-backgrounding-occluded-windows ^
+        %EXTENSION_FLAG% ^
         "http://localhost:3000?token=!token!&mode=exam"
 )
 

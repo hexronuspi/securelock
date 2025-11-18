@@ -139,21 +139,6 @@ export default function Home() {
     return 'HIGH';
   };
 
-  const launchKiosk = () => {
-    // Generate secure token
-    const timestamp = Date.now().toString();
-    const randomPart = Math.random().toString(36).substr(2, 8);
-    const token = `exam_${timestamp}_${randomPart}`;
-    
-    window.postMessage({
-      type: 'LAUNCH_KIOSK',
-      token: token
-    }, '*');
-    
-    // Show confirmation
-    alert('Secure mode request sent. The system will restart in secure exam mode.');
-  };
-
   const risk = securityData?.risk ?? null;
 
   return (
@@ -439,22 +424,7 @@ export default function Home() {
           {done ? '✅ Submitted' : securityError ? '⚠️ Submit (Security Warning)' : 'Submit Exam'}
         </button>
 
-        {!isKioskMode && (
-          <button 
-            onClick={launchKiosk}
-            style={{
-              padding: '12px 24px',
-              backgroundColor: '#FF9800',
-              color: 'white',
-              border: 'none',
-              borderRadius: 6,
-              fontSize: 16,
-              cursor: 'pointer'
-            }}
-          >
-            🔒 Launch Secure Mode
-          </button>
-        )}
+
       </div>
 
       {isKioskMode && (
