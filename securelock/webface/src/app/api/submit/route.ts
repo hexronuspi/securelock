@@ -78,7 +78,6 @@ export async function POST(request: NextRequest) {
       console.log('Paste Count:', kd.pasteCount);
       console.log('Rapid Bursts:', kd.rapidBursts);
       console.log('Backspace Ratio:', (kd.backspaceRatio * 100).toFixed(1) + '%');
-      console.log('Typing Variance:', kd.typingVariance.toFixed(1) + 'ms²');
       console.log('Keystroke Risk Score:', kd.riskScore + '/10');
       
       if (kd.recentSuspicious.length > 0) {

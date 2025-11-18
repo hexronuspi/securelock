@@ -290,9 +290,6 @@ export default function Home() {
             <div>
               <strong>Backspace Ratio:</strong> {(keystrokeData.backspaceRatio * 100).toFixed(1)}%
             </div>
-            <div>
-              <strong>Typing Variance:</strong> {keystrokeData.typingVariance.toFixed(1)}ms²
-            </div>
           </div>
           
           <div style={{ marginBottom: 15 }}>
