@@ -1,3 +1,6 @@
+The explanatory docs are at https://github.com/hexronuspi/securelock/blob/main/IICPC_DOCS.pdf
+<br/>
+
 Run these code to fix the host through which the extension will communicate with the .exe
 
 
